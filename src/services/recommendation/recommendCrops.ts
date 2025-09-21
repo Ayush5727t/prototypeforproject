@@ -1,4 +1,4 @@
-import { cropLibrary, CropRequirements } from './cropLibrary';
+import { cropLibrary } from './cropLibrary';
 import { DailyForecast } from '../openmeteo';
 
 export interface RecommendationInput {
@@ -7,7 +7,7 @@ export interface RecommendationInput {
   sand?: number | null;
   silt?: number | null;
   clay?: number | null;
-  orgCarbon?: number | null; // soc
+  orgCarbon?: number | null; // soil organic carbon
   // weather
   forecast?: DailyForecast[]; // from context
   rainfallLast24h?: number;
@@ -20,34 +20,75 @@ export interface CropScoreBreakdown {
   rainfall: number;
   ph: number;
   texture: number;
-  seasonality: number;
+  season: number;
+  soc?: number;
+  humidity?: number;
+  anomalies?: number;
 }
 
 export interface CropRecommendationComputed {
   id: string;
   names: { english: string; hindi: string };
-  score: number; // 0-1
+  overallScore: number; // 0-1 aggregated adaptive score
+  confidence: number; // 0-100 scaled
   suitability: 'excellent' | 'good' | 'moderate' | 'poor';
-  confidence: number; // simple proxy (fraction of factors with non-null data)
   reasons: { english: string[]; hindi: string[] };
-  breakdown: CropScoreBreakdown;
+  factorScores: CropScoreBreakdown;
+  limitingFactors: string[];
+  meta: {
+    weeklyRainfall: number | null;
+    temperatureSampleCount: number;
+    agroSeason: 'kharif' | 'rabi' | 'zaid';
+    texture: string | null;
+    completeness: number;
+  };
+  debug?: Record<string, any>;
 }
 
-// Range scoring: 1 inside range; smooth decay (quadratic) outside up to 50% penalty at 25% deviation beyond range, 0 at 50% deviation
+// Legacy simple range score retained for pH usage
 export function rangeScore(value: number | null | undefined, [min, max]: [number, number]): number {
   if (value === null || value === undefined || isNaN(value)) return 0;
   if (value >= min && value <= max) return 1;
   const span = max - min;
   if (span <= 0) return 0;
   if (value < min) {
-    const d = (min - value) / span; // deviation fractions relative to span
+    const d = (min - value) / span;
     if (d >= 0.5) return 0;
-    return 1 - (d / 0.5) ** 2; // quadratic falloff
-  } else { // value > max
+    return 1 - (d / 0.5) ** 2;
+  } else {
     const d = (value - max) / span;
     if (d >= 0.5) return 0;
     return 1 - (d / 0.5) ** 2;
   }
+}
+
+// Trapezoidal suitability (a,b plateau start; c plateau end; d) returns 0..1
+function trapezoidScore(value: number | undefined | null, a: number, b: number, c: number, d: number): number {
+  if (value == null || isNaN(value)) return 0;
+  if (value <= a || value >= d) return 0;
+  if (value >= b && value <= c) return 1;
+  if (value > a && value < b) return (value - a) / (b - a);
+  return (d - value) / (d - c);
+}
+
+function gaussianScore(value: number | undefined | null, center: number, idealHalfWidth: number, sigmaFactor = 1.8): number {
+  if (value == null || isNaN(value)) return 0;
+  const sigma = idealHalfWidth / sigmaFactor;
+  const exponent = -Math.pow(value - center, 2) / (2 * sigma * sigma);
+  return Math.max(0, Math.min(1, Math.exp(exponent)));
+}
+
+function softSeasonScore(inSeason: boolean, inSowingWindow: boolean, monthDistance: number): number {
+  if (inSeason && inSowingWindow) return 1;
+  if (inSeason && !inSowingWindow) return 0.75;
+  const decay = Math.max(0, 1 - (monthDistance / 4));
+  return 0.4 * decay;
+}
+
+function adaptiveWeight(base: number, score: number): number {
+  if (score >= 0.85) return base * 0.8; // damp near perfect
+  if (score <= 0.4) return base * 1.25; // emphasize weak
+  return base;
 }
 
 // Simple soil texture classification (approx): returns primary bucket plus combos
@@ -68,105 +109,248 @@ export function classifyTexture(sand?: number | null, silt?: number | null, clay
   return 'loamy';
 }
 
-function seasonScore(requirements: CropRequirements, now: Date): number {
-  if (!requirements.seasonality || requirements.seasonality.length === 0) return 1; // neutral
-  const monthIdx = now.getUTCMonth(); // 0-based
-  const monthMap = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'] as const;
-  const current = monthMap[monthIdx];
-  return requirements.seasonality.includes(current) ? 1 : 0.4; // penalize off-season but not zero
+function basicMonthMap() { return ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'] as const; }
+function monthName(now: Date) { return basicMonthMap()[ now.getUTCMonth() ]; }
+
+// Derive broad Indian agro season from month (can be regionalized later)
+export function deriveAgroSeason(d: Date): 'kharif' | 'rabi' | 'zaid' {
+  const m = d.getUTCMonth()+1; // 1-12
+  // Rough grouping: Kharif (Jun-Oct), Rabi (Nov-Mar), Zaid (Apr-May, also mid-summer gap)
+  if (m >= 6 && m <= 10) return 'kharif';
+  if (m === 4 || m === 5) return 'zaid';
+  return 'rabi';
 }
 
 export function computeWeeklyRainfall(forecast?: DailyForecast[]): number | null {
   if (!forecast || forecast.length === 0) return null;
-  // assume forecast has precipitation_sum or rainfall; adapt if not
-  const sums: number[] = [];
-  for (const d of forecast.slice(0,7)) {
-    const p = (d as any).precipitation_sum ?? (d as any).rainfall ?? null;
-    if (typeof p === 'number') sums.push(p);
+  const days = forecast.slice(0,7);
+  const vals: number[] = [];
+  for (const d of days) {
+    // Our DailyForecast interface exposes totalPrecipMm
+    if (typeof (d as any).totalPrecipMm === 'number') vals.push((d as any).totalPrecipMm);
+    else {
+      const fallback = (d as any).precipitation_sum ?? (d as any).rainfall;
+      if (typeof fallback === 'number') vals.push(fallback);
+    }
   }
-  if (!sums.length) return null;
-  return sums.reduce((a,b) => a + b, 0);
+  if (!vals.length) return null;
+  return vals.reduce((a,b)=>a+b,0);
 }
 
-export function recommendCrops(input: RecommendationInput): CropRecommendationComputed[] {
+export function recommendCrops(input: RecommendationInput, topN = 5, options?: { debug?: boolean }): CropRecommendationComputed[] {
   const now = input.now || new Date();
-  const weeklyRain = computeWeeklyRainfall(input.forecast);
+  const weeklyRainfall = computeWeeklyRainfall(input.forecast);
   const texture = classifyTexture(input.sand, input.silt, input.clay);
+  const agroSeason = deriveAgroSeason(now);
+  const monthStr = monthName(now);
 
   const results: CropRecommendationComputed[] = [];
 
   for (const crop of cropLibrary) {
-    const tScore = (() => {
-      // approximate avg temperature from forecast by mean of first 7 days mid temps
-      if (!input.forecast || input.forecast.length === 0) return 0;
+    const limiting: string[] = [];
+    const reasonsEn: string[] = [];
+    const reasonsHi: string[] = [];
+    const debug: Record<string, any> = {};
+
+    // --- Temperature (Gaussian) ---
+    let temperatureScore = 0;
+    let avgTemp: number | null = null;
+    if (input.forecast && input.forecast.length) {
       const temps: number[] = [];
       for (const d of input.forecast.slice(0,7)) {
         if (typeof d.minTemp === 'number' && typeof d.maxTemp === 'number') temps.push((d.minTemp + d.maxTemp)/2);
         else if (typeof (d as any).temperature_mean === 'number') temps.push((d as any).temperature_mean);
       }
-      if (!temps.length) return 0;
-      const avg = temps.reduce((a,b) => a + b, 0) / temps.length;
-      return rangeScore(avg, crop.temperatureRange);
-    })();
+      if (temps.length) {
+        avgTemp = temps.reduce((a,b)=>a+b,0)/temps.length;
+        const mid = (crop.temperatureRange[0] + crop.temperatureRange[1]) / 2;
+        const half = (crop.temperatureRange[1] - crop.temperatureRange[0]) / 2;
+        temperatureScore = gaussianScore(avgTemp, mid, half);
+        if (avgTemp < crop.temperatureRange[0]-5 || avgTemp > crop.temperatureRange[1]+5) {
+          limiting.push('Temperature outside tolerance');
+        } else if (temperatureScore < 0.5) {
+          limiting.push('Temperature suboptimal');
+        }
+      } else {
+        limiting.push('Temperature unknown');
+      }
+    } else {
+      limiting.push('Temperature unknown');
+    }
 
-    const rScore = rangeScore(weeklyRain, crop.rainfallRange);
+    // --- Rainfall (Trapezoid) ---
+    let rainfallScore = 0;
+    if (weeklyRainfall != null) {
+      const [rMin, rMax] = crop.rainfallRange;
+      const a = rMin * 0.5; // 50% of min start zero
+      const b = rMin;       // start plateau
+      const c = rMax;       // end plateau
+      const d = rMax * 1.4; // 40% above max zero again
+      rainfallScore = trapezoidScore(weeklyRainfall, a, b, c, d);
+      if (rainfallScore < 0.55) {
+        if (weeklyRainfall < rMin) limiting.push('Low rainfall');
+        else if (weeklyRainfall > rMax) {
+          const excessPct = (weeklyRainfall - rMax) / rMax;
+            if (excessPct < 0.15) limiting.push('Slight excess rainfall');
+            else limiting.push('Excess rainfall');
+        } else limiting.push('Rainfall variability');
+      }
+    } else {
+      limiting.push('Rainfall unknown');
+    }
+
+    // --- pH ---
     const phScore = rangeScore(input.ph ?? null, crop.phRange);
-    const texScore = (() => {
-      if (!texture) return 0;
-      return crop.texture.includes(texture as any) ? 1 : 0.3; // partial penalty for mismatch
-    })();
-    const seasScore = seasonScore(crop, now);
+    if (phScore === 0) limiting.push('pH unsuitable');
+    else if (phScore < 0.5) limiting.push('pH marginal');
 
-    // Weighted aggregation
-    const breakdown: CropScoreBreakdown = {
-      temperature: tScore,
-      rainfall: rScore,
-      ph: phScore,
-      texture: texScore,
-      seasonality: seasScore
+    // --- SOC (optional heuristic) ---
+    let socScore: number | undefined = undefined;
+    if (input.orgCarbon != null) {
+      // heuristics: assume desirable if >0.5 for most field crops
+      const soc = input.orgCarbon;
+      if (soc >= 0.5) socScore = 1; else if (soc > 0.25) socScore = soc / 0.5; else { socScore = soc / 0.5; limiting.push('Low organic carbon'); }
+    }
+
+    // --- Texture ---
+    let textureScore = 0.4; // mild neutral if unknown
+    if (!texture) limiting.push('Texture unknown');
+    else if (crop.texture.includes(texture as any)) textureScore = 1; else textureScore = 0.3;
+    if (textureScore < 0.5 && texture) limiting.push('Texture mismatch');
+
+    // --- Season & sowing window ---
+    const sowingMonths = crop.seasonality || [];
+    const inSowing = sowingMonths.includes(monthStr as any);
+    const inSeason = inSowing; // (simplified: using same array)
+    let monthDistance = 0;
+    if (!inSowing && sowingMonths.length) {
+      const cur = now.getUTCMonth()+1;
+      monthDistance = Math.min(...sowingMonths.map(mName => {
+        const idx = basicMonthMap().indexOf(mName as any)+1;
+        const diff = Math.abs(idx - cur);
+        return Math.min(diff, 12-diff);
+      }));
+    }
+    const seasonScore = softSeasonScore(inSeason, inSowing, monthDistance);
+    if (seasonScore < 0.7) limiting.push('Outside ideal sowing window');
+
+    // --- Combine & adaptive weights ---
+    let weights = {
+      temperature: 0.2,
+      rainfall: 0.2,
+      ph: 0.15,
+      texture: 0.12,
+      season: 0.15,
+      soc: socScore != null ? 0.08 : 0,
+      anomalies: 0.08,
+      humidity: 0 // reserved
     };
 
-    const weights = { temperature: 0.28, rainfall: 0.25, ph: 0.18, texture: 0.14, seasonality: 0.15 };
-    const score = Object.entries(breakdown).reduce((acc, [k,v]) => acc + v * (weights as any)[k], 0);
+    weights.temperature = adaptiveWeight(weights.temperature, temperatureScore);
+    weights.rainfall = adaptiveWeight(weights.rainfall, rainfallScore);
+    weights.ph = adaptiveWeight(weights.ph, phScore);
+    weights.texture = adaptiveWeight(weights.texture, textureScore);
+    weights.season = adaptiveWeight(weights.season, seasonScore);
+    if (socScore != null) weights.soc = adaptiveWeight(weights.soc, socScore);
 
-    const presentFactors = [tScore, rScore, phScore, texScore, seasScore].filter(v => v > 0).length;
-    const confidence = presentFactors / 5; // simple proportion
+    const weightSum = Object.values(weights).reduce((a,b)=>a+b,0);
+    Object.keys(weights).forEach(k => { (weights as any)[k] = (weights as any)[k] / weightSum; });
 
-    const suitability: CropRecommendationComputed['suitability'] = score >= 0.8 ? 'excellent' : score >= 0.6 ? 'good' : score >= 0.4 ? 'moderate' : 'poor';
+    const overall =
+      temperatureScore * weights.temperature +
+      rainfallScore * weights.rainfall +
+      phScore * weights.ph +
+      textureScore * weights.texture +
+      seasonScore * weights.season +
+      (socScore ?? 1) * (weights.soc || 0);
 
-    const reasonsEn: string[] = [];
-    const reasonsHi: string[] = [];
+    // Data completeness (core: temp, rain, ph, texture, season, soc?)
+    const coreFactorsPresence = [temperatureScore>0, rainfallScore>0, phScore>0, textureScore>0, seasonScore>0, (socScore==null?true:socScore>0)];
+    const completeness = coreFactorsPresence.filter(Boolean).length / coreFactorsPresence.length;
 
-    if (tScore >= 0.8) { reasonsEn.push('Temperature is within optimal range'); reasonsHi.push('तापमान आदर्श सीमा में है'); }
-    else if (tScore >= 0.5) { reasonsEn.push('Temperature is acceptable'); reasonsHi.push('तापमान स्वीकार्य है'); }
-    else { reasonsEn.push('Temperature outside ideal range'); reasonsHi.push('तापमान आदर्श सीमा से बाहर है'); }
+    const hardFails = limiting.filter(l => /outside tolerance|unsuitable/i.test(l)).length;
+    const penalty = Math.max(0.65, 1 - hardFails * 0.15 - (limiting.length - hardFails) * 0.05);
+    const confidence = overall * (0.6 + 0.4 * completeness) * penalty;
 
-    if (rScore >= 0.8) { reasonsEn.push('Expected rainfall suits this crop'); reasonsHi.push('अनुमानित वर्षा इस फसल के अनुकूल है'); }
-    else if (rScore >= 0.5) { reasonsEn.push('Rainfall partly suitable'); reasonsHi.push('वर्षा आंशिक रूप से उपयुक्त'); }
-    else { reasonsEn.push('Rainfall may be insufficient/excess'); reasonsHi.push('वर्षा अपर्याप्त या अधिक हो सकती है'); }
+    // Suitability buckets
+    const suitability: CropRecommendationComputed['suitability'] = overall >= 0.8 ? 'excellent' : overall >= 0.6 ? 'good' : overall >= 0.4 ? 'moderate' : 'poor';
 
-    if (phScore >= 0.8) { reasonsEn.push('Soil pH is optimal'); reasonsHi.push('मिट्टी का pH आदर्श है'); }
-    else if (phScore >= 0.5) { reasonsEn.push('Soil pH is acceptable'); reasonsHi.push('मिट्टी का pH स्वीकार्य है'); }
-    else { reasonsEn.push('Soil pH outside ideal range'); reasonsHi.push('मिट्टी का pH आदर्श सीमा से बाहर'); }
+    // Reasons (English/Hindi)
+    if (temperatureScore >= 0.8) { reasonsEn.push('Temperature near ideal'); reasonsHi.push('तापमान लगभग आदर्श'); }
+    else if (temperatureScore >= 0.5) { reasonsEn.push('Temperature acceptable'); reasonsHi.push('तापमान स्वीकार्य'); }
+    else { reasonsEn.push('Temperature limiting'); reasonsHi.push('तापमान सीमित कारक'); }
 
-    if (texScore >= 0.9) { reasonsEn.push('Soil texture matches crop preference'); reasonsHi.push('मिट्टी की बनावट फसल के अनुरूप'); }
-    else if (texScore >= 0.3) { reasonsEn.push('Soil texture partially suitable'); reasonsHi.push('मिट्टी की बनावट आंशिक रूप से उपयुक्त'); }
-    else { reasonsEn.push('Soil texture not ideal'); reasonsHi.push('मिट्टी की बनावट उपयुक्त नहीं'); }
+    if (rainfallScore >= 0.8) { reasonsEn.push('Rainfall within comfortable band'); reasonsHi.push('वर्षा उपयुक्त सीमा में'); }
+    else if (rainfallScore >= 0.55) { reasonsEn.push('Rainfall marginally acceptable'); reasonsHi.push('वर्षा सीमांत रूप से स्वीकार्य'); }
+    else {
+      if (weeklyRainfall != null) {
+        const [rMin, rMax] = crop.rainfallRange;
+        if (weeklyRainfall < rMin) { reasonsEn.push('Rainfall likely insufficient'); reasonsHi.push('वर्षा संभवतः अपर्याप्त'); }
+        else if (weeklyRainfall > rMax) {
+          const excessPct = (weeklyRainfall - rMax)/rMax;
+          if (excessPct < 0.15) { reasonsEn.push('Slight rainfall excess'); reasonsHi.push('वर्षा थोड़ी अधिक'); }
+          else { reasonsEn.push('Excess rainfall risk'); reasonsHi.push('अधिक वर्षा का जोखिम'); }
+        }
+      } else { reasonsEn.push('Rainfall data missing'); reasonsHi.push('वर्षा डेटा अनुपलब्ध'); }
+    }
 
-    if (seasScore >= 0.9) { reasonsEn.push('Current month aligns with sowing season'); reasonsHi.push('वर्तमान माह बुवाई मौसम से मेल खाता'); }
-    else { reasonsEn.push('Off typical sowing season'); reasonsHi.push('सामान्य बुवाई मौसम से बाहर'); }
+    if (phScore >= 0.8) { reasonsEn.push('Soil pH optimal'); reasonsHi.push('मिट्टी का pH आदर्श'); }
+    else if (phScore >= 0.5) { reasonsEn.push('Soil pH acceptable'); reasonsHi.push('मिट्टी का pH स्वीकार्य'); }
+    else { reasonsEn.push('Soil pH limiting'); reasonsHi.push('मिट्टी का pH सीमित'); }
+
+    if (textureScore >= 0.9) { reasonsEn.push('Texture well-suited'); reasonsHi.push('बनावट उपयुक्त'); }
+    else if (textureScore >= 0.5) { reasonsEn.push('Texture partially suitable'); reasonsHi.push('बनावट आंशिक रूप से उपयुक्त'); }
+    else { reasonsEn.push('Texture mismatch'); reasonsHi.push('बनावट मेल नहीं खाती'); }
+
+    if (seasonScore >= 0.85) { reasonsEn.push('Within sowing window'); reasonsHi.push('बुवाई समय के भीतर'); }
+    else if (seasonScore >= 0.6) { reasonsEn.push('Near sowing window'); reasonsHi.push('बुवाई समय के निकट'); }
+    else { reasonsEn.push('Outside typical sowing period'); reasonsHi.push('सामान्य बुवाई अवधि से बाहर'); }
+
+    reasonsEn.push(`Agro season: ${agroSeason}`);
+    reasonsHi.push(`कृषि मौसम: ${agroSeason === 'kharif' ? 'खरीफ' : agroSeason === 'rabi' ? 'रबी' : 'ज़ैद'}`);
+
+    if (options?.debug) {
+      debug.temperatureScore = temperatureScore;
+      debug.rainfallScore = rainfallScore;
+      debug.phScore = phScore;
+      debug.textureScore = textureScore;
+      debug.seasonScore = seasonScore;
+      debug.weights = weights;
+      debug.overall = overall;
+      debug.completeness = completeness;
+      debug.penalty = penalty;
+      debug.avgTemp = avgTemp;
+      debug.weeklyRainfall = weeklyRainfall;
+    }
+
+    const factorScores: CropScoreBreakdown = {
+      temperature: Number(temperatureScore.toFixed(2)),
+      rainfall: Number(rainfallScore.toFixed(2)),
+      ph: Number(phScore.toFixed(2)),
+      texture: Number(textureScore.toFixed(2)),
+      season: Number(seasonScore.toFixed(2)),
+      soc: socScore != null ? Number(socScore.toFixed(2)) : undefined
+    };
 
     results.push({
       id: crop.id,
       names: crop.names,
-      score: Math.round(score * 1000)/1000,
+      overallScore: Number(overall.toFixed(3)),
+      confidence: Number((confidence * 100).toFixed(1)),
       suitability,
-      confidence: Math.round(confidence * 1000)/1000,
       reasons: { english: reasonsEn, hindi: reasonsHi },
-      breakdown
+      factorScores,
+      limitingFactors: limiting,
+      meta: {
+        weeklyRainfall: weeklyRainfall,
+        temperatureSampleCount: input.forecast ? Math.min(7, input.forecast.length) : 0,
+        agroSeason,
+        texture,
+        completeness: Number(completeness.toFixed(2))
+      },
+      debug: options?.debug ? debug : undefined
     });
   }
 
-  // Sort by score desc
-  return results.sort((a,b) => b.score - a.score);
+  return results.sort((a,b)=> b.overallScore - a.overallScore).slice(0, topN);
 }

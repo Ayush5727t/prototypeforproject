@@ -54,13 +54,13 @@ export const cropLibrary: CropRequirements[] = [
   {
     id: 'soybean',
     names: { english: 'Soybean', hindi: 'सोयाबीन' },
-    temperatureRange: [15, 30],
-    rainfallRange: [30, 90],
+    temperatureRange: [24, 32],
+    rainfallRange: [40, 120],
     phRange: [6.0, 7.5],
     texture: ['loamy', 'sandy-loam', 'clay-loam'],
     rootingDepth: 'medium',
-    seasonality: ['jun','jul'],
-    notes: 'Moderate water; fixes nitrogen.'
+    seasonality: ['jun','jul','aug','sep'],
+    notes: 'Widely grown in Madhya Pradesh during Kharif; fits local monsoon climate.'
   },
   {
     id: 'chickpea',
