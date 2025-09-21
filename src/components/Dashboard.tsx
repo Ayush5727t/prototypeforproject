@@ -18,7 +18,6 @@ import {
 import { useLanguage } from '../contexts/LanguageContext';
 import { useAppData } from '../contexts/AppDataContext';
 import { SoilDebugPanel } from './SoilDebugPanel';
-import { CropRecommendations } from './CropRecommendations';
 import { DashboardStats } from '../types';
 
 interface DashboardProps {
@@ -312,18 +311,33 @@ export const Dashboard: React.FC<DashboardProps> = ({
         </div>
       </div>
 
-      {/* Dynamic Crop Recommendations (Top 3) */}
-      <div className="border-2 border-emerald-500 bg-emerald-50 rounded-lg p-4 shadow-sm">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-lg font-semibold text-emerald-800">Top Crop Recommendations</h3>
-          <button
-            onClick={onNavigateToRecommendations}
-            className="text-xs font-medium text-emerald-700 hover:text-emerald-800 underline"
-          >
-            Full View
+      {/* Recent Recommendations */}
+      <div className="bg-white rounded-lg p-6 shadow-sm border">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold text-gray-800">{t('quickRecommendations')}</h3>
+          <button className="text-sm text-green-600 hover:text-green-700 font-medium">
+            {t('viewAll')}
           </button>
         </div>
-  <CropRecommendations limit={1} compact />
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {[
+            { crop: 'Rice', hindi: 'धान', score: 92, season: 'Kharif' },
+            { crop: 'Wheat', hindi: 'गेहूं', score: 88, season: 'Rabi' },
+            { crop: 'Maize', hindi: 'मक्का', score: 85, season: 'Kharif' }
+          ].map((item, index) => (
+            <div key={index} className="p-4 bg-gray-50 rounded-lg border">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="font-semibold text-gray-800">
+                  {language === 'hi' ? item.hindi : item.crop}
+                </h4>
+                <span className="text-sm bg-green-100 text-green-800 px-2 py-1 rounded-full">
+                  {item.score}%
+                </span>
+              </div>
+              <p className="text-sm text-gray-600">{item.season} Season</p>
+            </div>
+          ))}
+        </div>
       </div>
 
       {/* Soil Debug Panel */}

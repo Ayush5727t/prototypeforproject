@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
-import { Leaf, Home, Settings as SettingsIcon, Cloud, Menu, X, MessageCircle } from 'lucide-react';
-import AIChatSidebar from './components/AIChatSidebar';
+import { Leaf, Home, Settings as SettingsIcon, Cloud, Menu, X } from 'lucide-react';
 import { LanguageProvider, useLanguage } from './contexts/LanguageContext';
 import { AppDataProvider, useAppData } from './contexts/AppDataContext';
 import { LanguageToggle } from './components/LanguageToggle';
@@ -18,7 +17,6 @@ const AppContent: React.FC = () => {
   const { setLocationAndFetch } = useAppData();
   const [state, setState] = useState<AppState>('location');
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [chatOpen, setChatOpen] = useState(false);
 
   // Navigation logic
   const handleNavigateToDashboard = () => {
@@ -130,7 +128,7 @@ const AppContent: React.FC = () => {
       )}
 
       {/* Main Content Area */}
-  <div className="flex-1 flex flex-col relative">
+      <div className="flex-1 flex flex-col">
         {/* Top Header */}
         {state !== 'location' && (
           <header className="bg-white shadow-sm border-b">
@@ -166,20 +164,12 @@ const AppContent: React.FC = () => {
             <SettingsPanel onBack={handleNavigateToDashboard} />
           )}
           {state === 'form' && (
-            <InputForm />
+            <InputForm 
+              onSubmit={() => {}} 
+              loading={false}
+            />
           )}
         </main>
-        {/* Floating Chat Toggle Button */}
-        {state !== 'location' && (
-          <button
-            onClick={() => setChatOpen(true)}
-            className="fixed bottom-5 right-5 sm:right-6 z-40 bg-emerald-600 hover:bg-emerald-700 text-white rounded-full w-14 h-14 flex items-center justify-center shadow-lg border border-emerald-500"
-            title="Open AI Chat"
-          >
-            <MessageCircle className="w-7 h-7" />
-          </button>
-        )}
-        <AIChatSidebar open={chatOpen} onClose={() => setChatOpen(false)} />
       </div>
     </div>
   );
